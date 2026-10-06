@@ -1,0 +1,93 @@
+name: Deploy KlinSync DB (S3)
+
+# Empacota o repositório (migrations + app Node opcional) e publica no bucket S3 klinsync-db (us-east-2):
+#   releases/klinsync-db-<data>-<sha>.tar.gz   código da release
+#   releases/latest.txt                        aponta para a release atual
+#   scripts/                                   scripts de operação das EC2
+# A EC2 de DB puxa a release do S3, aplica as migrations e atualiza o app com
+# `sudo klinsync-db-deploy` (ou o deploy manual abaixo).
+#
+# Mesmo padrão do tf-vpc: ambiente develop + role vinda do secret AWS_ROLE_ARN_DEVELOP (OIDC).
+#
+# Secrets (Settings > Environments > develop):
+#   AWS_ROLE_ARN_DEVELOP   ARN da role assumida via OIDC (AMZ-GITHUB)
+#   EC2_INSTANCE_ID        (opcional) id da EC2 de DB, para o deploy manual com SSM
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_ec2:
+        description: "Depois de publicar, rodar o deploy (migrations) na EC2 via SSM (precisa do secret EC2_INSTANCE_ID)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-db-s3
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: develop
+    timeout-minutes: 15
+    env:
+      AWS_REGION: us-east-2
+      DB_BUCKET: klinsync-db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Validar role da AWS
+        env:
+          AWS_ROLE_ARN_DEVELOP: ${{ secrets.AWS_ROLE_ARN_DEVELOP }}
+        run: |
+          [ -n "$AWS_ROLE_ARN_DEVELOP" ] || { echo "❌ Secret AWS_ROLE_ARN_DEVELOP não definido ou inacessível"; exit 1; }
+
+      - name: Configurar credenciais da AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEVELOP }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Validar autenticação e bucket
+        run: |
+          aws sts get-caller-identity
+          aws s3api head-bucket --bucket "$DB_BUCKET"
+
+      - name: Validar scripts e migrations
+        run: |
+          for f in scripts/*.sh; do bash -n "$f"; done
+          if [ -d migrations ]; then
+            # Nomes em ordem alfabética (o deploy aplica nessa ordem) e sem arquivos vazios
+            for f in migrations/*.sql; do
+              [ -e "$f" ] || continue
+              [ -s "$f" ] || { echo "❌ Migration vazia: $f"; exit 1; }
+            done
+            ls -1 migrations/*.sql 2>/dev/null | sort -c || { echo "❌ Migrations fora de ordem alfabética"; exit 1; }
+          fi
+
+      - name: Publicar no S3
+        run: bash scripts/publish.sh
+
+      - name: Deploy na EC2 (SSM)
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy_ec2
+        env:
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          [ -n "$EC2_INSTANCE_ID" ] || { echo "❌ Secret EC2_INSTANCE_ID não definido"; exit 1; }
+          CMD_ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript --comment "klinsync-db ${GITHUB_SHA::7}" \
+            --parameters 'commands=["/usr/local/bin/klinsync-db-deploy"]' \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" || true
+          STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" --query Status --output text)
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" --query StandardOutputContent --output text
+          [ "$STATUS" = "Success" ] || { echo "❌ Deploy na EC2 falhou ($STATUS)"; exit 1; }
