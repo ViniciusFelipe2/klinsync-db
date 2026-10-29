@@ -23,16 +23,13 @@ if [ ! -d "$DIR" ]; then
   exit 0
 fi
 
-[ -f "$DB_ENV" ] || die "$DB_ENV não existe."
-set -a
-# shellcheck disable=SC1090
-. "$DB_ENV"
-set +a
-
 exec 8>/var/lock/klinsync-db-migrate.lock
 flock -n 8 || die "Outra migração está em andamento."
 
-PSQL=(psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1)
+# As migrations rodam como superusuário (peer, socket local), mas assumindo a role dona dos objetos (SET ROLE):
+# o que elas criam fica do klinsync_owner, e a role da API (klinsync_app) nunca recebe DDL.
+ensure_db_roles
+PSQL=(psql_admin -d "$DB_NAME" -q)
 "${PSQL[@]}" -c "CREATE TABLE IF NOT EXISTS public.schema_migrations (
   filename   text PRIMARY KEY,
   checksum   text NOT NULL,
@@ -48,8 +45,8 @@ while IFS= read -r f; do
     continue
   fi
   log "Aplicando $name"
-  "${PSQL[@]}" --single-transaction -f "$f" \
-    -c "INSERT INTO public.schema_migrations (filename, checksum) VALUES ('$name', '$sum')"
+  "${PSQL[@]}" --single-transaction -c "SET ROLE $DB_OWNER_ROLE" -f - -c "RESET ROLE" \
+    -c "INSERT INTO public.schema_migrations (filename, checksum) VALUES ('$name', '$sum')" < "$f"
   APPLIED=$((APPLIED + 1))
 done < <(find "$DIR" -maxdepth 1 -type f -name '*.sql' | sort)
 

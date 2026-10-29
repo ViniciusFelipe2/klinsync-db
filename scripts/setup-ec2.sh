@@ -79,9 +79,21 @@ log "Configurando o PostgreSQL (acesso, banco e role)"
 HBA_FILE="$(psql_admin -tAc 'SHOW hba_file')"
 psql_admin -c "ALTER SYSTEM SET listen_addresses = 'localhost,$DB_PRIVATE_IP'"
 psql_admin -c "ALTER SYSTEM SET password_encryption = 'scram-sha-256'"
+# TLS entre o backend e o banco. No Debian/Ubuntu o pacote já traz um certificado autoassinado; no Amazon Linux geramos um.
+PGDATA_DIR="$(psql_admin -tAc 'SHOW data_directory')"
+if [ ! -s "$PGDATA_DIR/server.crt" ] && [ ! -s /etc/ssl/certs/ssl-cert-snakeoil.pem ]; then
+  openssl req -new -x509 -days 3650 -nodes -subj "/CN=klinsync-db" -out "$PGDATA_DIR/server.crt" -keyout "$PGDATA_DIR/server.key"
+  chown postgres:postgres "$PGDATA_DIR/server.crt" "$PGDATA_DIR/server.key"
+  chmod 600 "$PGDATA_DIR/server.key"
+fi
+psql_admin -c "ALTER SYSTEM SET ssl = 'on'"
 HBA_MARK="# klinsync-backend"
 if ! grep -q "$HBA_MARK" "$HBA_FILE"; then
-  printf '%s\nhost    %s    %s    %s/32    scram-sha-256\n' "$HBA_MARK" "$DB_NAME" "$DB_USER" "$BACKEND_PRIVATE_IP" >> "$HBA_FILE"
+  # Instalação nova: só aceita o backend com TLS (hostssl). O backend sobe com DB_SSL=require.
+  printf '%s\nhostssl %s    %s    %s/32    scram-sha-256\n' "$HBA_MARK" "$DB_NAME" "$DB_USER" "$BACKEND_PRIVATE_IP" >> "$HBA_FILE"
+elif [ "${DB_REQUIRE_SSL:-0}" = "1" ]; then
+  # Instalação existente: só endurece quando pedido (o backend precisa ter DB_SSL=require antes, senão perde o banco).
+  sed -i "/^$HBA_MARK/{n;s/^host\([[:space:]]\)/hostssl\1/}" "$HBA_FILE"
 fi
 systemctl restart postgresql
 
@@ -97,6 +109,8 @@ if ! psql_admin -tAc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep
 fi
 psql_admin -c "REVOKE ALL ON DATABASE $DB_NAME FROM PUBLIC"
 psql_admin -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS pgcrypto"
+# A API (klinsync_app) fica só com DML; o dono dos objetos é a role de grupo klinsync_owner (assumida pelas migrations).
+ensure_db_roles
 
 if [ -n "$DB_PASSWORD" ]; then
   log "Gravando credenciais"
@@ -110,8 +124,9 @@ EOF
   chown "root:$APP_USER" "$DB_ENV"; chmod 640 "$DB_ENV"
   cat > "$CREDENTIALS_FILE" <<EOF
 # GUARDE EM LOCAL SEGURO E APAGUE ESTE ARQUIVO DEPOIS.
-# Use no /etc/klinsync/backend.env da EC2 de backend:
+# Use no /etc/klinsync/backend.env da EC2 de backend (e mantenha DB_SSL=require):
 DATABASE_URL=postgresql://$DB_USER:$DB_PASSWORD@$DB_PRIVATE_IP:5432/$DB_NAME
+DB_SSL=require
 EOF
   chmod 600 "$CREDENTIALS_FILE"
 else

@@ -36,6 +36,26 @@ createdb klinsync
 psql klinsync -v ON_ERROR_STOP=1 -f migrations/0001_schema.sql -f migrations/0002_seed.sql
 ```
 
+### Roles e privilégios (segurança)
+
+| Role | Papel | Login |
+| --- | --- | --- |
+| `klinsync_owner` | Dono do banco e de todos os objetos. As migrations rodam como ela (`SET ROLE` feito pelo `migrate.sh`). | Não (`NOLOGIN`, sem senha) |
+| `klinsync_app` | Usada pela API. Só `SELECT/INSERT/UPDATE/DELETE`; sem DDL, sem `TRUNCATE`. Nos logs de auditoria (`log_acoes_sensiveis`, `tenant_features_historico`) não tem nem `UPDATE`. | Sim |
+
+- `ensure_db_roles` (em `scripts/common.sh`) cria/ajusta tudo de forma idempotente a cada `migrate`/`setup`, e define as *default privileges*: tabelas
+  criadas por migrations futuras já ficam acessíveis (DML) à `klinsync_app`.
+- A migration `0006_privilegios_minimos.sql` revoga o excesso nas tabelas existentes. Ela só age onde a role `klinsync_app` existe.
+- **Cargas e importações com `TRUNCATE`** (o dump `klinsync-dados.sql`, `npm run import-supabase`) precisam rodar como dono, por exemplo
+  `sudo -u postgres psql -d klinsync -c "SET ROLE klinsync_owner" -f - < klinsync-dados.sql`. A role da API não consegue.
+- **TLS:** instalações novas aceitam o backend só por `hostssl`; o backend usa `DB_SSL=require`.
+
+#### Atualizando um banco que já está no ar
+
+1. `sudo klinsync-db-deploy`: o `migrate.sh` cria a role dona, transfere a posse dos objetos e aplica a `0006`. Nenhuma senha muda e a API continua conectando como `klinsync_app`.
+2. Confira: `sudo -u postgres psql -d klinsync -c '\dt'` (dono = `klinsync_owner`) e, no painel master, a checagem "Aplicação com privilégios mínimos no banco" deve ficar **ok**.
+3. TLS (opcional, depois de ligar `DB_SSL=require` no `/etc/klinsync/backend.env` e reiniciar a API): `sudo DB_REQUIRE_SSL=1 bash setup-ec2.sh` troca o `host` do `pg_hba.conf` por `hostssl`.
+
 ### Regras para novas migrations
 
 - Arquivos `NNNN_descricao.sql` em ordem alfabética, cada um em transação. **Nunca edite** uma migration já aplicada (o checksum é validado): crie outra.

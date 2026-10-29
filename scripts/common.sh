@@ -162,3 +162,30 @@ health_check() {
   done
   return 1
 }
+
+# Separa as roles do banco (idempotente; usa DB_NAME e DB_USER do deploy.env):
+#   klinsync_owner  dono do banco e dos objetos; sem login (NOLOGIN). O migrate.sh a assume com SET ROLE.
+#   $DB_USER        role da API (klinsync_app): só DML, sem DDL. Os privilégios por tabela vêm das migrations;
+#                   as default privileges abaixo cobrem as tabelas criadas por migrations futuras.
+DB_OWNER_ROLE="${DB_OWNER_ROLE:-klinsync_owner}"
+ensure_db_roles() {
+  DB_USER="${DB_USER:-klinsync_app}"
+  psql_admin -tAc "SELECT 1 FROM pg_roles WHERE rolname='$DB_OWNER_ROLE'" | grep -q 1 \
+    || psql_admin -c "CREATE ROLE $DB_OWNER_ROLE NOLOGIN"
+  psql_admin -d "$DB_NAME" -v owner="$DB_OWNER_ROLE" -v app="$DB_USER" -v db="$DB_NAME" <<'SQL'
+ALTER DATABASE :"db" OWNER TO :"owner";
+GRANT CONNECT ON DATABASE :"db" TO :"app";
+REASSIGN OWNED BY :"app" TO :"owner";
+ALTER SCHEMA public OWNER TO :"owner";
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+REVOKE ALL ON SCHEMA public FROM :"app";
+GRANT USAGE ON SCHEMA public TO :"app";
+ALTER ROLE :"app" NOSUPERUSER NOCREATEDB NOCREATEROLE;
+ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO :"app";
+ALTER DEFAULT PRIVILEGES FOR ROLE :"owner" IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO :"app";
+SQL
+}
+
+# psql como superusuário do Postgres, já assumindo a role dona dos objetos (para DDL/carga de dados).
+# O SQL vai por stdin: o arquivo pode estar em /root, ilegível para o usuário postgres.
+psql_como_dono() { psql_admin -d "$DB_NAME" -c "SET ROLE $DB_OWNER_ROLE" "$@"; }
