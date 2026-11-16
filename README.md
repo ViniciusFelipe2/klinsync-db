@@ -18,6 +18,7 @@ scripts/            setup da EC2, migrate, deploy, backup, tune (ver scripts/REA
 | Segurança e auditoria | `log_acessos`, `log_acoes_sensiveis`, `config_seguranca`, `ip_bloqueios`, `rate_limits` |
 | Check-in | `check_ins` (a foto fica no S3; aqui só o caminho) |
 | Giro de sala | `salas`, `eventos_giro`, `eventos_sala_parada`, `sala_dispositivos` |
+| CME | `cme_contas`, `cme_config`, `cme_codigos`, `cme_caixas`, `cme_caixa_itens`, `cme_colaboradores`, `cme_sessoes_cracha`, `cme_leituras`, `cme_testes_leitura`, `cme_auditoria` (leituras, testes e auditoria só aceitam INSERT, por gatilho no banco) |
 
 Diferenças em relação ao projeto mãe (Supabase):
 
@@ -60,6 +61,7 @@ psql klinsync -v ON_ERROR_STOP=1 -f migrations/0001_schema.sql -f migrations/000
 
 - Arquivos `NNNN_descricao.sql` em ordem alfabética, cada um em transação. **Nunca edite** uma migration já aplicada (o checksum é validado): crie outra.
 - Escreva-as compatíveis com a versão anterior da API (o deploy aplica as migrations antes de trocar o backend).
+- Migrations que precisam de volta têm o script em `migrations/down/`. O `migrate.sh` não lê essa pasta: a reversão é sempre manual, como dono do banco e depois de um backup.
 - Ao alterar o schema, rode `npm run sync-schema` no `klinsync-backend` para atualizar o espelho usado nos testes.
 
 ## Trazendo os dados do Supabase
